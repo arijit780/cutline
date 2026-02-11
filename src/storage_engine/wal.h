@@ -1,26 +1,28 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <functional>
+#include <vector>
 
-struct Bytes {
-    const uint8_t* data;
-    size_t len; 
+struct LogRecord {
+    std::vector<uint8_t> bytes;
 };
 
-using log_sequence_number = uint64_t;
-
-struct WalAppendResult {
-    log_sequence_number lsn;
-};
 class WriteAheadLog {
 public:
-    virtual ~WriteAheadLog() = default;
-    virtual WalAppendResult append(const Bytes& record) = 0; // append raw bytes to the log
+    explicit WriteAheadLog(const char* path);
+    ~WriteAheadLog();
 
-    virtual void flush(log_sequence_number lsn) = 0; // ensure all appended records are durable
+    // Append a log record to the WAL. This should be atomic and durable.
+    void append(const LogRecord& record);
 
-    virtual void replay(
-        void (*consumer)(const Bytes& record, void* ctx),
-        void* ctx
-    ) = 0; // replay all records from the log, calling consumer for each record
+    // Flush any pending writes (append already fsyncs)
+    void flush();
+
+    // Replay all records from the WAL file
+    void replay(const std::function<void(const LogRecord&)>& apply);
+
+private:
+    int fd_;
+    const char* path_;
 };
