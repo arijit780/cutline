@@ -21,8 +21,21 @@ public:
 
     // Replay all records from the WAL file
     void replay(const std::function<void(const LogRecord&)>& apply);
+    // Helper methods for constructing transactional records
+    void begun_tx(uint64_t txid);
+
+    void tx_put(uint64_t tx_id, const std::vector<uint8_t>& key, const std::vector<uint8_t>& value);
+
+    void tx_delete(uint64_t tx_id, const std::vector<uint8_t>& key);
+
+    void commit_tx(uint64_t tx_id);
 
 private:
     int fd_;
     const char* path_;
+    bool tx_active_ ;
+    uint64_t current_tx_id_; // Track active transaction ID for validation during replay
 };
+
+// Helper to create a commit record for a transaction
+LogRecord make_commit_record(uint64_t tx_id);

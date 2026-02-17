@@ -11,12 +11,70 @@
 #include "wal_format.h"
 using namespace std;
 
+// ---------------- CRC32 helpers ----------------
+static uint32_t crc32_update(uint32_t crc, const uint8_t* buf, size_t len) {
+    static uint32_t table[256];
+    static bool table_init = false;
+    if (!table_init) {
+        const uint32_t poly = 0xEDB88320u;
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (size_t j = 0; j < 8; ++j) {
+                if (c & 1) c = poly ^ (c >> 1);
+                else c = c >> 1;
+            }
+            table[i] = c;
+        }
+        table_init = true;
+    }
+
+    uint32_t r = crc ^ 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        r = table[(r ^ buf[i]) & 0xFFu] ^ (r >> 8);
+    }
+    return r ^ 0xFFFFFFFFu;
+}
+
+static uint32_t compute_record_crc(const wal_record_header_v2& hdr, const uint8_t* payload, size_t payload_len) {
+    uint32_t crc = 0u;
+    crc = crc32_update(crc, reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr));
+    if (payload_len > 0 && payload != nullptr) {
+        crc = crc32_update(crc, payload, payload_len);
+    }
+    return crc;
+}
+
+
+LogRecord make_commit_record(uint64_t tx_id) {
+    wal_record_header_v2 hdr;
+    hdr.magic = WAL_MAGIC;
+    hdr.version = WAL_VERSION;
+    hdr.type = WAL_TX_COMMIT;
+    hdr.txid = tx_id;
+    hdr.key_len = 0;
+    hdr.value_len = 0;
+
+    uint32_t crc = compute_record_crc(hdr, nullptr, 0); 
+    LogRecord rec;
+    rec.bytes.resize(sizeof(hdr) + sizeof(crc));
+    // Copy header at the beginning of the record
+    memcpy(rec.bytes.data(), &hdr, sizeof(hdr));
+    // Compute CRC (empty payload)
+    crc = compute_record_crc(hdr, nullptr, 0);
+    // Copy CRC at the end of the record
+    memcpy(rec.bytes.data() + sizeof(hdr), &crc, sizeof(crc));
+    return rec;
+}
+
+
 WriteAheadLog::WriteAheadLog(const char* path) : path_(path) {
     // write-only, create if not exists, append mode, with permissions 0644
     fd_ = ::open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if(fd_ < 0){
         throw runtime_error("Failed to open WAL file: " + string(strerror(errno)));
     }
+    tx_active_ = false;
+    current_tx_id_ = 0;
 }
 
 WriteAheadLog::~WriteAheadLog(){
@@ -39,10 +97,6 @@ void WriteAheadLog::append(const LogRecord& record){
         }
         written += static_cast<size_t>(rc);//Move forward by bytes actually written,Loop continues until full record is written
     }
-    // fsync to ensure durability
-    if(::fsync(fd_) < 0){// call also happens here
-        throw runtime_error("Failed to fsync WAL: " + string(strerror(errno)));
-    } 
 }
 
 void WriteAheadLog::flush(){
@@ -56,7 +110,7 @@ void WriteAheadLog::replay(const function<void(const LogRecord&)>& apply) {
     }
 
     while (true) {
-        wal_record_header_v1 hdr;
+        wal_record_header_v2 hdr;
 
         // 1. Read header
         ssize_t n = ::read(fd, &hdr, sizeof(hdr));
@@ -76,7 +130,7 @@ void WriteAheadLog::replay(const function<void(const LogRecord&)>& apply) {
         }
 
         // 3. Validate version
-        if (hdr.version != WAL_VERSION_V1) {
+        if (hdr.version != WAL_VERSION) {
             // Unknown format → stop
             break;
         }
@@ -106,10 +160,104 @@ void WriteAheadLog::replay(const function<void(const LogRecord&)>& apply) {
         memcpy(rec.bytes.data() + sizeof(hdr) + payload_len, &stored_crc, sizeof(stored_crc));  // copy crc into record bytes
 
         // 7. Apply record
-        apply(rec);// apply record to MemTable. this logic lies outside of the wal
+        apply(rec);// apply record to MemTable. this logic lies outside of the
     }
 
     ::close(fd);
 }
 
+
+void WriteAheadLog::begun_tx(uint64_t txid) {
+    // Construct a BEGIN record
+    wal_record_header_v2 hdr;
+    hdr.magic = WAL_MAGIC;
+    hdr.version = WAL_VERSION;
+    hdr.type = WAL_TX_BEGIN;
+    hdr.key_len = 0;
+    hdr.value_len = 0;
+
+    LogRecord rec;
+    rec.bytes.resize(sizeof(hdr));
+    memcpy(rec.bytes.data(), &hdr, sizeof(hdr));
+
+    append(rec);
+}
+
+
+
+LogRecord make_commit_record(uint64_t tx_id) {
+    wal_record_header_v2 hdr;
+    hdr.magic = WAL_MAGIC;
+    hdr.version = WAL_VERSION;
+    hdr.type = WAL_TX_COMMIT;
+    hdr.txid = tx_id;
+    hdr.key_len = 0;
+    hdr.value_len = 0;
+
+    uint32_t crc = compute_record_crc(hdr, nullptr, 0); 
+    LogRecord rec;
+    rec.bytes.resize(sizeof(hdr) + sizeof(crc));
+    // Copy header at the beginning of the record
+    memcpy(rec.bytes.data(), &hdr, sizeof(hdr));
+    // Compute CRC (empty payload)
+    crc = compute_record_crc(hdr, nullptr, 0);
+    // Copy CRC at the end of the record
+    memcpy(rec.bytes.data() + sizeof(hdr), &crc, sizeof(crc));
+    return rec;
+}
+
+void WriteAheadLog::tx_put(uint64_t tx_id, const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
+    wal_record_header_v2 hdr;
+    hdr.magic = WAL_MAGIC;
+    hdr.version = WAL_VERSION;
+    hdr.type = WAL_TX_PUT;
+    hdr.txid = tx_id;
+    hdr.key_len = static_cast<uint32_t>(key.size());
+    hdr.value_len = static_cast<uint32_t>(value.size());
+
+    size_t payload_len = key.size() + value.size();
+    std::vector<uint8_t> payload(payload_len);
+    memcpy(payload.data(), key.data(), key.size());
+    memcpy(payload.data() + key.size(), value.data(), value.size());
+
+    uint32_t crc = compute_record_crc(hdr, payload.data(), payload_len);
+
+    LogRecord rec;
+    rec.bytes.resize(sizeof(hdr) + payload_len + sizeof(crc));
+    memcpy(rec.bytes.data(), &hdr, sizeof(hdr));
+    memcpy(rec.bytes.data() + sizeof(hdr), payload.data(), payload_len);
+    memcpy(rec.bytes.data() + sizeof(hdr) + payload_len, &crc, sizeof(crc));
+
+    append(rec);
+}
+
+void WriteAheadLog::tx_delete(uint64_t tx_id, const std::vector<uint8_t>& key) {
+    wal_record_header_v2 hdr;
+    hdr.magic = WAL_MAGIC;
+    hdr.version = WAL_VERSION;
+    hdr.type = WAL_TX_DELETE;
+    hdr.txid = tx_id;
+    hdr.key_len = static_cast<uint32_t>(key.size());
+    hdr.value_len = 0;
+
+    size_t payload_len = key.size();
+
+    uint32_t crc = compute_record_crc(hdr, key.data(), payload_len);
+
+    LogRecord rec;
+    rec.bytes.resize(sizeof(hdr) + payload_len + sizeof(crc));
+    memcpy(rec.bytes.data(), &hdr, sizeof(hdr));
+    memcpy(rec.bytes.data() + sizeof(hdr), key.data(), payload_len);
+    memcpy(rec.bytes.data() + sizeof(hdr) + payload_len, &crc, sizeof(crc));
+
+    append(rec);
+}
+
+void WriteAheadLog::commit_tx(uint64_t tx_id) {
+    LogRecord rec = make_commit_record(tx_id);
+    append(rec);
+    if(::fsync(fd_)<0){
+        throw runtime_error("Failed to fsync WAL after commit: " + string(strerror(errno)));
+    }
+}
 
