@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <functional>
 #include <vector>
+#include <unordered_set>
 
 struct LogRecord {
     std::vector<uint8_t> bytes;
@@ -33,8 +34,9 @@ public:
 private:
     int fd_;
     const char* path_;
-    bool tx_active_ ;
-    uint64_t current_tx_id_; // Track active transaction ID for validation during replay
+    bool tx_active_;
+    uint64_t current_tx_id_;
+    std::unordered_set<uint64_t> active_txs_; // Track active transactions for validation during replay
 };
 
 // Helper to create a commit record for a transaction
