@@ -222,6 +222,11 @@ void WriteAheadLog::replay(const function<void(const LogRecord&)>& apply) {
 
 
 void WriteAheadLog::begun_tx(uint64_t txid) {
+    if(tx_active_){
+        throw runtime_error("Transaction already active, cannot begin a new one");
+    }
+    tx_active_ = true;
+    current_tx_id_ = txid;
     // Construct a BEGIN record
     wal_record_header_v2 hdr;
     hdr.magic = WAL_MAGIC;
@@ -245,6 +250,9 @@ void WriteAheadLog::begun_tx(uint64_t txid) {
 
 
 void WriteAheadLog::tx_put(uint64_t tx_id, const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
+    if(!tx_active_ || tx_id != current_tx_id_){
+        throw runtime_error("No active transaction or txid mismatch for PUT");
+    }
     wal_record_header_v2 hdr;
     hdr.magic = WAL_MAGIC;
     hdr.version = WAL_VERSION;
@@ -270,6 +278,9 @@ void WriteAheadLog::tx_put(uint64_t tx_id, const std::vector<uint8_t>& key, cons
 }
 
 void WriteAheadLog::tx_delete(uint64_t tx_id, const std::vector<uint8_t>& key) {
+    if(!tx_active_ || tx_id != current_tx_id_){
+        throw runtime_error("No active transaction or txid mismatch for DELETE");
+    }
     wal_record_header_v2 hdr;
     hdr.magic = WAL_MAGIC;
     hdr.version = WAL_VERSION;
@@ -294,10 +305,13 @@ void WriteAheadLog::tx_delete(uint64_t tx_id, const std::vector<uint8_t>& key) {
 }
 
 void WriteAheadLog::commit_tx(uint64_t tx_id) {
+    if(!tx_active_ || tx_id != current_tx_id_){
+        throw runtime_error("No active transaction or txid mismatch for COMMIT");
+    }
     LogRecord rec = make_commit_record(tx_id);
     append(rec);
     if(::fsync(fd_)<0){
         throw runtime_error("Failed to fsync WAL after commit: " + string(strerror(errno)));
     }
+    tx_active_ = false;
 }
-

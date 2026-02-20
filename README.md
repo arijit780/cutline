@@ -1,174 +1,79 @@
-Here’s a **clean, well-arranged, internally consistent version** of your notes. I’ve **only reorganized and tightened**, not changed meaning.
+# KV Store — Single-Writer, Crash-Safe Storage Engine
 
----
+## What This Is
 
-# KV Store Theory
+A minimal, correct key-value storage engine with:
+- **Durability**: Writes persisted via Write-Ahead Log (WAL) + fsync
+- **Atomicity**: Multi-key transactions with redo-only recovery
+- **Single writer**: No concurrency control
+- **Crash safety**: WAL replay reconstructs committed state
 
-## Weeks 1–2 — Storage Engine Boundaries
+## Core Invariants
 
-### Architectural constraints
+1. **A transaction is durable iff its COMMIT record is fsync'd**
+   - BEGIN has no durability meaning
+   - PUT/DELETE have no durability meaning
+   - Only COMMIT + fsync guarantees atomicity
 
-* Only the **StorageAdapter** may call into the storage engine.
-* The storage engine exposes **mutation and read primitives only**.
-* CRUD semantics, queries, and user intent must **not** appear in storage APIs.
-* The storage engine may depend **only** on filesystem and OS primitives.
-* The storage engine must not know about:
+2. **Recovery applies only committed transactions**
+   - Scan WAL sequentially
+   - Collect records by transaction
+   - Apply only committed transactions
+   - First corruption halts replay
 
-  * networking
-  * queries
-  * clients
-  * transactions
-* The storage engine must be **fully swappable** without recompiling server logic.
+3. **Runtime isolation without MVCC**
+   - Readers read only MemTable
+   - Writers buffer uncommitted changes
+   - Changes applied only after COMMIT+fsync
 
----
+## WAL Record Format
 
-### WAL as an internal mechanism
+```
+[Header: 22 bytes]
+  magic      (4B)   = 0x57414C32 ("WAL2")
+  version    (1B)   = 0x02
+  type       (1B)   = BEGIN|PUT|DELETE|COMMIT
+  txid       (8B)   = transaction ID
+  key_len    (4B)   = key size in bytes
+  value_len  (4B)   = value size in bytes
 
-* WAL is an **internal mechanism** for durability and crash recovery.
-* WAL concepts must **not leak** outside the storage module.
-* No WAL symbols (LSN, offsets, flush) may appear in public APIs.
-* The storage engine may use WAL internally but must not expose it.
+[Payload]
+  key        (key_len bytes)
+  value      (value_len bytes)
 
----
+[Checksum]
+  crc32      (4B)   = CRC over header + payload
+```
 
-### WAL responsibilities
+## API
 
-* All mutations must be written to WAL **before** being applied.
-* WAL is **append-only**, operating on raw byte records.
-* WAL uses **log sequence numbers (LSN)** to define ordering and durability.
-* WAL must support:
+```cpp
+void begin_tx(uint64_t txid);
+void tx_put(uint64_t txid, const vector<uint8_t>& key, const vector<uint8_t>& value);
+void tx_delete(uint64_t txid, const vector<uint8_t>& key);
+void commit_tx(uint64_t txid);    // fsync included
+void replay(function<void(const LogRecord&)> apply);
+```
 
-  * append
-  * flush up to a specific LSN
-  * replay to reconstruct state after crash
-* WAL implementation details remain **opaque** to callers.
+## Crash Semantics
 
----
+| Crash Point | Outcome |
+|-------------|---------|
+| During write | Transaction discarded |
+| Before COMMIT+fsync | Transaction discarded |
+| After COMMIT+fsync | Transaction applied |
 
-## Week 3 — Durability & Filesystem Reality
+## Files
 
-### Durability (the contract)
+- `wal.h/cpp` — WAL implementation (append, commit, replay)
+- `wal_format.h` — Record format, constants
+- `storage_engine.h` — Interface
+- `in_memory_kv.h/cpp` — MemTable (not integrated)
 
-* Durability is **user-visible**, not a storage detail.
-* **If `put()` returns OK, the write must survive a crash.**
-* Volatile state (CPU, memory, page cache) is allowed to disappear.
-* Only **crash-stable storage** counts.
+## Design
 
----
-
-### What exists on disk
-
-* Persistence is **per inode**, not per path.
-* A file consists of **three independent objects**:
-
-  * **Directory inode + blocks** → filename → inode mapping
-  * **File inode** → size, block pointers, metadata
-  * **Data blocks** → actual bytes
-* These objects are dirtied and flushed **independently**.
-
----
-
-### `fsync` / `fdatasync` semantics (inode-level)
-
-* `fsync(fd)`
-
-  * Flushes:
-
-    * data blocks
-    * **all** inode metadata
-  * Does **not** flush:
-
-    * directory entries
-
-* `fdatasync(fd)`
-
-  * Flushes:
-
-    * data blocks
-    * **minimal inode metadata** (size, block pointers)
-  * Skips:
-
-    * timestamps
-    * permissions
-    * ownership
-  * Does **not** flush:
-
-    * directory entries
-
-* `fsync(dirfd)`
-
-  * Flushes:
-
-    * directory data blocks
-    * directory inode
-  * Guarantees:
-
-    * filename → inode mapping is durable
-
----
-
-### Core invariant
-
-* **fsync applies to exactly one inode.**
-* There is **no implicit propagation** to:
-
-  * parent directories
-  * child files
-  * related inodes
-
----
-
-### New file / namespace changes
-
-* Creating, renaming, or unlinking a file dirties:
-
-  * directory inode
-  * file inode
-  * data blocks
-* Required for durability:
-
-  * `fdatasync(fd)` or `fsync(fd)` → file contents + inode
-  * `fsync(dirfd)` → name → inode mapping
-* `fsync(fd)` alone is **insufficient**.
-* `fdatasync(fd)` alone is **insufficient**.
-
----
-
-### Existing file (steady state)
-
-* File already exists.
-* Directory entry already durable.
-* No renames or deletes.
-* Only dirty:
-
-  * data blocks
-  * possibly file size / block pointers.
-* **Minimal correct operation**:
-
-  * `fdatasync(fd)`
-* No directory fsync needed.
-* Dropping sync entirely **breaks durability**.
-
----
-
-### Why databases preallocate WAL
-
-* Directory fsyncs are expensive.
-* WAL design eliminates directory changes from the hot path:
-
-  * create WAL files once
-  * `fsync(dirfd)` once
-  * preallocate file size
-  * steady state uses `fdatasync(fd)`
-* This is a **correctness requirement**, not an optimization.
-
----
-
-## Final mental model post week 3
-
-* Durability = **reachable inode + correct data blocks**
-* `fdatasync` is the **cheapest correct primitive**
-* It works **only** when directory durability is already solved
-* Everything else is an implementation detail
-
-
+- **Redo-only**: No undo; replay applies only committed TXs
+- **Prefix-based**: First corruption halts replay
+- **Fsync at COMMIT**: COMMIT is durability boundary
+- **CRC validation**: Detects corruption
+- **Size limits**: Prevents OOM
