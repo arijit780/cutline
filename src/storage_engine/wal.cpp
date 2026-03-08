@@ -9,6 +9,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
 #include "wal.h"
 #include "wal_format.h"
 using namespace std;
@@ -315,3 +316,26 @@ void WriteAheadLog::commit_tx(uint64_t tx_id) {
     }
     tx_active_ = false;
 }
+
+void WriteAheadLog::background_fsync() {
+    // Spawn detached thread to fsync asynchronously
+    // Thread captures fd_ by value (int is cheap to copy)
+    // Caller retains ownership of this WAL object; must not destroy until thread completes
+    std::thread([fd = fd_]() {
+        if (::fsync(fd) < 0) {
+            // Log error but don't throw (thread would terminate silently)
+            cerr << "Warning: Background fsync failed: " << strerror(errno) << "\n";
+        }
+    }).detach();
+}
+
+void WriteAheadLog::commit_tx_async(uint64_t tx_id) {
+    if(!tx_active_ || tx_id != current_tx_id_){
+        throw runtime_error("No active transaction or txid mismatch for COMMIT");
+    }
+    LogRecord rec = make_commit_record(tx_id);
+    append(rec);
+    // Note: No fsync here. Caller must invoke background_fsync() later
+    tx_active_ = false;
+}
+

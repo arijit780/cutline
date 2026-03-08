@@ -3,17 +3,22 @@
 #include "storage_engine.h"
 #include <atomic>
 #include <vector>
+#include <map>
 
-// Week 5: Lock-Free, Append-Only Linked List
-struct Node {
-    std::vector<uint8_t> key;
+// Week 5 (revised): Copy‑on‑write MemTable
+//
+// Instead of an append‑only list of updates, maintain a fully materialized
+// map of the latest state. Readers snapshot an atomic pointer to the current
+// "root" map. Writers clone the map, apply the mutation, then publish the
+// new pointer with release semantics. Old maps are leaked (reclaimed later
+// in Week 7).
+
+struct ValueEntry {
     std::vector<uint8_t> value;
-    uint64_t version;
-    Node* next;
-    
-    Node(const std::vector<uint8_t>& k, const std::vector<uint8_t>& v, uint64_t ver, Node* n)
-        : key(k), value(v), version(ver), next(n) {}
+    Version version;
 };
+
+using MemTable = std::map<std::vector<uint8_t>, ValueEntry>;
 
 class InMemoryKV : public StorageEngine {
     public:
@@ -33,8 +38,8 @@ class InMemoryKV : public StorageEngine {
         ) override;
 
     private:
-        // Global head pointer: atomic publication point
-        // Invariant: next pointers immutable after publication
-        // Memory is leaked (intentional for Week 5)
-        std::atomic<Node*> head_;
+        // Atomic pointer to current memtable (copy‑on‑write root)
+        // Invariant: map object is immutable after publication
+        // Memory is leaked (intentional for Week 5; reclamation in Week 7)
+        std::atomic<MemTable*> root_;
 };

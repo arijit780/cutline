@@ -22,6 +22,11 @@ public:
 
     // Replay all records from the WAL file
     void replay(const std::function<void(const LogRecord&)>& apply);
+    
+    // Schedule an async fsync in background thread
+    // Caller retains ownership of this WAL object; do not destroy until fsync completes
+    void background_fsync();
+    
     // Helper methods for constructing transactional records
     void begun_tx(uint64_t txid);
 
@@ -30,6 +35,10 @@ public:
     void tx_delete(uint64_t tx_id, const std::vector<uint8_t>& key);
 
     void commit_tx(uint64_t tx_id);
+    
+    // Append COMMIT record without fsyncing (for ASYNC mode)
+    // Caller is responsible for calling background_fsync() later
+    void commit_tx_async(uint64_t tx_id);
 
 private:
     int fd_;

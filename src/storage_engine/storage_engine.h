@@ -19,12 +19,18 @@ struct Status{
 
 using Version = uint64_t;
 
+enum class CommitMode {
+    SYNC,   // Fsync blocks: append → fsync → apply → publish
+    ASYNC   // Fsync background: append → apply → publish → fsync async
+};
+
 struct ReadOptions {
     Version visible_up_to;
 };
 
 struct WriteOptions {
     Version commit_version;
+    CommitMode commit_mode = CommitMode::SYNC;  // Default to blocking fsync
 };
 
 class StorageEngine {
