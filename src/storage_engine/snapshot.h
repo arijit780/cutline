@@ -3,30 +3,31 @@
 #include <string>
 #include <cstdint>
 #include "memtable.h"
+#include "snapshot_format.h"
 
-// SnapshotManager is responsible only for
+// ------------------------------------------------------------
+// Snapshot Manager
+// ------------------------------------------------------------
+//
+// Responsible for:
 //   - writing snapshots to disk
 //   - loading snapshots during recovery
 //
 // Snapshot invariant:
+// snapshot_state == replay(WAL up to snapshot_lsn)
 //
-//   snapshot_state == replay(WAL up to snapshot_lsn)
-//
-// snapshot_lsn marks the WAL position that the snapshot represents.
 
 class SnapshotManager {
 public:
     explicit SnapshotManager(const std::string& directory);
 
-    // Write a snapshot of the provided immutable memtable
-    // snapshot_lsn identifies the WAL boundary for this snapshot.
+    // Serialize immutable memtable to disk snapshot
     bool write_snapshot(const MemTable* table, uint64_t snapshot_lsn);
 
-    // Load snapshot from disk.
-    // Reconstructs memtable contents and returns snapshot_lsn.
+    // Load snapshot from disk into memtable
     bool load_snapshot(MemTable& table, uint64_t& snapshot_lsn);
 
-    // Check whether a snapshot file exists
+    // Check whether snapshot exists
     bool snapshot_exists() const;
 
 private:
